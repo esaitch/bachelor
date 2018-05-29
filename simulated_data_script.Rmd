@@ -1,0 +1,696 @@
+---
+title: "Data simulation functions and estimating on fake data (model prior checking)"
+author: "Stine Hansen"
+date: "April 15 2018"
+output: html_document
+---
+
+This script includes the code for generating datasets for a Biased Nash, win-stay/lose-shift and reinforcement learning model. 
+We can then fit models on this simulated data. The Stan models used can be found here: https://github.com/stineh/bachelor
+We include code for checking the priors (density plots, known values against estimated, absolute difference)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(tidyverse,boot,brms,dplyr,ggplot2,rstan,reshape2,Rmisc)
+```
+
+Set WD
+```{r}
+setwd("") #change to wanted working directory
+```
+
+## Simulating datasets
+The data simulating functions are made in collaboration with Riccardo Fusaroli.
+
+Set common parameters
+```{r}
+# Number of participants
+P=10
+# Trials for each participant (observations)
+N=100 #or 1000
+```
+
+## Multilevel Optimal Nash w different thetas
+
+```{r}
+# Overall log-odds of choosing the right hand
+thetaG=0 # logit(0.5) = 0
+# Variation by Participant
+thetaP=1
+
+#Define function
+NashSimulation <- function(Participants, Trials, ThetaGroup,ThetaSubjectVariation){
+  
+  theta=inv.logit(rnorm(Participants,ThetaGroup,ThetaSubjectVariation)) #create normally distributed theta values, normal distribution
+
+# Setting up the simulation
+  # for each trial for each participant, the outcome (0 or 1) is decided by a binomial distribution with probability of success of theta for the participant 
+  # returns data frame with outcome, thetaG, thetaP, subjectID
+  Outcome=NULL
+  for (t in seq(Participants)){
+    Outcome_tmp = data.frame(outcome=rbinom(Trials,1,theta[t]),thetaG=inv.logit(ThetaGroup),thetaP=theta[t],subjectID=t)
+    if (exists("Outcome")){Outcome=rbind(Outcome,Outcome_tmp)} else {Outcome=Outcome_tmp}
+    Outcome_tmp=NULL
+  }
+  return(Outcome)
+}
+
+```
+
+
+## WSLS
+Simulate data for WSLS
+```{r}
+# Group paramters
+StayBiasG=1 
+ShiftBiasG=1
+BiasVariation=1
+
+#Define function
+WSLSsimulationSimple <- function(P,NT,StayBiasG,ShiftBiasG, BiasVariation) {
+    # Generating individual parameters for biases
+    # normally distributed, mean and variation from group
+    StayBias = rep(inv.logit(rnorm(P, StayBiasG, BiasVariation)), each = NT)
+    ShiftBias = rep(inv.logit(rnorm(P, ShiftBiasG, BiasVariation)), each = NT)
+    
+    # Random sequence of successes for the algorithm to adapt
+    Success = NA
+    for (i in seq(NT * P)) {
+      Theta_t = inv.logit(rnorm(1, 0, 1))
+      Success[i] = rbinom(1, 1, Theta_t)
+    }
+    
+    # Setting up simulation 
+    Outcome = NULL
+    Right = NULL
+
+      for (i in seq(NT * P)) {
+        # If first trial, then random choice
+        if (i == 1) {
+          p <- rbinom(1, 1, 0.5)
+        }
+        # If not first trial, one of these 4 conditions
+        else {
+          # Choice on previous trial = right hand and Correct
+          if (Right[i - 1] == 1 & Success[i - 1] == 1) {
+            p = StayBias[i]
+          }
+          # Choice on previous trial = right hand and inorrect
+          else if (Right[i - 1] == 1 & Success[i - 1] == 0) {
+            p = 1 - ShiftBias[i]
+          } 
+          # Choice on previous trial = left hand and inorrect
+          else if (Right[i - 1] == 0 & Success[i - 1] == 0) {
+            p = ShiftBias[i]
+          }
+          # Choice on previous trial = left hand and correct
+          else if (Right[i - 1] == 0 & Success[i - 1] == 1) {
+            p =  1 - StayBias[i]
+          }
+        }
+      
+      # Decide choice. Binomially distributed (0 or 1). probability of succes, p decided from nested loop above  
+      Right[i] = rbinom(1, 1, p)
+      }
+    
+    # Save to data frame
+    Outcome <- data.frame(Right,Success,StayBiasG,StayBias,ShiftBiasG,ShiftBias,Participant = rep(seq(P), each = NT))
+    return(Outcome)
+}
+```
+
+Simulate data for WSLS against WSLS
+```{r}
+# Define additional paramter for opponent
+OtherStayBias=2
+OtherShiftBias=2
+
+# Define function 
+WSLSsimulationWSLS <- function(P,NT,StayBiasG,ShiftBiasG, BiasVariation,OtherStayBias,OtherShiftBias) {
+    
+  #Generating individual parameters, also for opponent 
+    StayBias = rep(inv.logit(rnorm(P, StayBiasG, BiasVariation)), each = NT)
+    ShiftBias = rep(inv.logit(rnorm(P, ShiftBiasG, BiasVariation)), each = NT)
+    OtherStayBias=inv.logit(OtherStayBias)
+    OtherShiftBias=inv.logit(OtherShiftBias)
+    
+    # Setting up simulation 
+    Success = NULL
+    Outcome = NULL
+    Right = NULL
+    p=NULL
+    
+    for (i in seq(NT * P)) {
+      # If first trial, then random choice for both players
+      if (i == 1) {
+        p[1] <- rbinom(1, 1, 0.5)
+        p[2] <- rbinom(1, 1, 0.5)
+      }
+      # If not first trial, one of these 4 conditions
+      else {
+        # Choice on previous trial = right hand and correct
+        # For opponent this means a loss, so previous trial = right and incorrect
+        if (Right[i - 1] == 1 & Success[i - 1] == 1) {
+          p[1] = StayBias[i]
+          p[2] = 1 - OtherShiftBias
+          
+        }
+        # Choice on previous trial = right and incorrect
+        # For opponent this means a win, so previous choice = left and correct
+        else if (Right[i - 1] == 1 & Success[i - 1] == 0) {
+          p[1] = 1 - ShiftBias[i]
+          p[2] = 1 - OtherStayBias
+          
+        } 
+        # Choice on previous trial = left and incorrect 
+        # For opponent this means a win, so previous choice = right and correct
+        else if (Right[i - 1] == 0 & Success[i - 1] == 0) {
+          p[1] = ShiftBias[i]
+          p[2] = OtherStayBias
+          
+        } 
+        # Choice on previous trial = left and correct
+        # For opponent this means a loss, so previous choice = left and incorrect
+        else if (Right[i - 1] == 0 & Success[i - 1] == 1) {
+          p[1] = 1 - StayBias[i]
+          p[2] = OtherShiftBias
+        }
+      }
+      
+      #Decide choice. Binomially distributed (0 or 1). probability of succes, p decided from nested loop above  
+      Right[i] = rbinom(1, 1, p[1])
+      OtherChoice=rbinom(1,1, p[2])
+      
+      # When choosing the same hand as opponent = success 
+      if (Right[i] == OtherChoice){
+        Success[i]=1
+      } else { Success[i]=0}
+      
+    }
+    
+    # Save to dataframe 
+    Outcome <-
+      data.frame(
+        Right,
+        Success,
+        StayBiasG,
+        StayBias,
+        ShiftBiasG,
+        ShiftBias,
+        Participant = rep(seq(P), each = NT),
+        OtherStayBias,
+        OtherShiftBias
+      )
+    return(Outcome)
+}
+```
+
+## Reinforcement Learning
+Simulate data for RL
+
+```{r}
+# Group parameters, log-odds
+LearningRateG=0
+BiasVariation=1
+
+# Define functions
+RLsimulationSimple <- function(P,NT,LearningRateG,BiasVariation,Theta) {
+    #Generating individual parameters
+    #normally distributed, mean and variation from group 
+    LearningRate = rep(inv.logit(rnorm(P, LearningRateG, BiasVariation)), each = NT)
+    
+    # Random sequence of successes for the algorithm to adapt
+    OtherRight = NULL
+    for (i in seq(NT * P)) {
+      OtherRight[i] = rbinom(1, 1, Theta)
+    }
+    
+    # Setting up simulation
+    Outcome = NULL
+    Right = NULL
+    Success=NULL
+    ValueLeft=NULL
+    ValueRight=NULL
+    
+    for (i in seq(NT * P)) {
+      # If first trial, then random choice
+      # equal values for both hands
+      if (i == 1) {
+        p <- rbinom(1, 1, 0.5)
+        ValueRight[i] = 0.5
+        ValueLeft[i] = 0.5
+      } 
+      # If not first trial, decide if previous trial was left or right hand choice
+      else {
+        # if previous choice was the right hand
+        if (Right[i - 1] == 1) {
+          ValueRight[i] = ValueRight[i-1] + LearningRate[i] * (Success[i-1] - ValueRight[i-1])
+          ValueLeft[i] = ValueLeft[i-1]
+          p = ValueRight[i]
+        }
+        # if previous choice was the left hand
+        else if (Right[i - 1] == 0 ) {
+          ValueLeft[i] = ValueLeft[i-1] + LearningRate[i] * (Success[i-1] - ValueLeft[i-1])
+          ValueRight[i] = ValueRight[i-1]
+          p = 1-ValueLeft[i]
+        }
+      }
+      
+      # Decide choice. Probability of success, p is decided above 
+      Right[i] = rbinom(1, 1, p)
+      # If the choice matches the opponent choice, it is a success
+      if (Right[i]==OtherRight[i]){Success[i]=1}else{Success[i]=0}
+    }
+    # Save to dataframe
+    Outcome <- data.frame(Right,Success,ValueRight,ValueLeft,LearningRateG,LearningRate,OtherRight,Participant = rep(seq(P), each = NT))
+    return(Outcome)
+  }
+```
+
+Simulate data for RL against RL
+```{r}
+# Define parameter for opponent
+OtherLearningRate = 1 
+
+#Define function 
+RLsimulationRL <- function(P,NT,LearningRateG,BiasVariation,Theta, OtherLearningRate) {
+    
+    #Generating individual parameters
+    LearningRate = rep(inv.logit(rnorm(P, LearningRateG, BiasVariation)), each = NT)
+    OtherLearningRate = rep(inv.logit(rnorm(P, OtherLearningRate, BiasVariation)), each = NT)
+    
+    # Setting up simulation 
+    Outcome = NULL
+    Right = NULL
+    Success=NULL
+    ValueLeft=NULL
+    ValueRight=NULL
+    OtherValueLeft=NULL
+    OtherValueRight=NULL
+    p=NULL
+    
+    for (i in seq(NT * P)) {
+      # If first trial, then random choice
+      if (i == 1) {
+        p[1] <- rbinom(1, 1, 0.5)
+        ValueRight[i] = 0.5
+        ValueLeft[i] = 0.5
+        p[2] <- rbinom(1, 1, 0.5)
+        OtherValueRight[i] = 0.5
+        OtherValueLeft[i] = 0.5
+      } 
+      else {
+        # If not first trial, decide if previous trial was left or right hand choice
+        # Previous = Right and correct
+        # This means previous = Right and incorrect for opponent
+        if (Right[i - 1] == 1) {
+          ValueRight[i] = ValueRight[i-1] + LearningRate[i] * (Success[i-1] - ValueRight[i-1])
+          ValueLeft[i] = ValueLeft[i-1]
+          p[1] = ValueRight[i]
+          OtherValueLeft[i] = OtherValueLeft[i-1] + OtherLearningRate[i] * (Success[i-1] - OtherValueLeft[i-1])
+          OtherValueRight[i] = OtherValueRight[i-1]
+          p[2] = 1-OtherValueLeft[i]
+        } 
+        
+        else if (Right[i - 1] == 0 ) {
+          # Previous = Left and incorrect
+          # This means previous = left and correct for opponent 
+          ValueLeft[i] = ValueLeft[i-1] + LearningRate[i] * (Success[i-1] - ValueLeft[i-1])
+          ValueRight[i] = ValueRight[i-1]
+          p[1] = 1-ValueLeft[i]
+          OtherValueRight[i] = OtherValueRight[i-1] + OtherLearningRate[i] * (Success[i-1] - OtherValueRight[i-1])
+          OtherValueLeft[i] = OtherValueLeft[i-1]
+          p[2] = OtherValueRight[i]
+        }
+      }
+      
+      # Decide choice. Probability of successes, p are decided above
+      Right[i] = rbinom(1, 1, p[1])
+      OtherRight=rbinom(1,1, p[2])
+      
+      # If the choice matches the opponent, it is a success
+      if (Right[i] == OtherRight) {
+        Success[i]=1
+      } else { Success[i]=0}
+    }
+    
+    # save to dataframe 
+    Outcome <- data.frame(Right,Success,ValueRight,ValueLeft,LearningRateG,LearningRate,OtherRight,Participant = rep(seq(P), each = NT))
+    return(Outcome)
+}
+```
+
+Simulate data for RL vs. WSLS
+Combine the two functions 
+```{r}
+WSLSsimulationRL <- function(P,NT,StayBiasG,ShiftBiasG, BiasVariation,LearningRateG) {
+    
+  #Generating individual parameters
+    StayBias = rep(inv.logit(rnorm(P, StayBiasG, BiasVariation)), each = NT)
+    ShiftBias = rep(inv.logit(rnorm(P, ShiftBiasG, BiasVariation)), each = NT)
+    LearningRate = rep(inv.logit(rnorm(P, 0, BiasVariation)), each = NT)
+    
+    # Setting up simulation
+    Success = NULL
+    Outcome = NULL
+    Right = NULL
+    p=NULL
+    ValueLeft=NULL
+    ValueRight=NULL
+    
+    for (i in seq(NT * P)) {
+      # If first trial, then random choice
+      if (i == 1) {
+        p[1] <- rbinom(1, 1, 0.5)
+        p[2] <- rbinom(1, 1, 0.5)
+        ValueRight[i] = 0.5
+        ValueLeft[i] = 0.5
+      } 
+      # If not first trial, one of these 4 conditions
+      else {
+        # Previous = Right 
+        # For WSLS opponent: Choice on previous trial = right hand and correct
+        if (Right[i - 1] == 1 & Success[i - 1] == 1) {
+          p[1] = StayBias[i]
+          ValueRight[i] = ValueRight[i-1] + LearningRate[i] * (Success[i-1] - ValueRight[i-1])
+          ValueLeft[i] = ValueLeft[i-1]
+          p[2] = ValueRight[i]
+          
+        } 
+        # Previous = Right 
+        # For WSLS opponent: Choice on previous trial = right and incorrect
+        else if (Right[i - 1] == 1 & Success[i - 1] == 0) {
+          p[1] = 1 - ShiftBias[i]
+          ValueRight[i] = ValueRight[i-1] + LearningRate[i] * (Success[i-1] - ValueRight[i-1])
+          ValueLeft[i] = ValueLeft[i-1]
+          p[2] = ValueRight[i]
+          
+        } 
+        # Previous = left
+        # For WSLS opponent: Choice on previous trial = left and incorrect
+        else if (Right[i - 1] == 0 & Success[i - 1] == 0) {
+          p[1] = ShiftBias[i]
+          ValueLeft[i] = ValueLeft[i-1] + LearningRate[i] * (Success[i-1] - ValueLeft[i-1])
+          ValueRight[i] = ValueRight[i-1]
+          p[2] = 1-ValueLeft[i]
+          
+        } 
+        # Previous = left
+        # For WSLS opponent: Choice on previous trial = left and correct
+        else if (Right[i - 1] == 0 & Success[i - 1] == 1) {
+          # Previous = Left and Correct; OTHER: Prev = Left and Not Correct
+          #print("Stay Left")
+          p[1] = 1 - StayBias[i]
+          ValueLeft[i] = ValueLeft[i-1] + LearningRate[i] * (Success[i-1] - ValueLeft[i-1])
+          ValueRight[i] = ValueRight[i-1]
+          p[2] = 1-ValueLeft[i]
+        }
+      }
+      
+      # Decide choices
+      Right[i] = rbinom(1, 1, p[1])
+      OtherChoice=rbinom(1,1, p[2])
+      
+      # When choices match, it is a success
+      if (Right[i] == OtherChoice){
+        Success[i]=1
+      } else { Success[i]=0}
+      
+    }
+    # Save to dataframe
+    Outcome <-
+      data.frame(
+        Right,
+        Success,
+        StayBiasG,
+        StayBias,
+        ShiftBiasG,
+        ShiftBias,
+        Participant = rep(seq(P), each = NT),
+        OtherChoice,
+        ValueRight,
+        ValueLeft,
+        LearningRate
+      )
+    return(Outcome)
+}
+```
+
+
+## Creating datasets
+Examples of calling the functions to generate datasets
+```{r}
+# For Biased Nash
+DataNash_G50_P1 <- NashSimulation(P,N,thetaG,thetaP) 
+#we can alter the values from the set common ones 
+DataNash_G05_P1 <- NashSimulation(P,N,logit(.05),thetaP) 
+DataNash_G90_P1 <- NashSimulation(P,N,logit(.9),thetaP)
+
+
+# For WSLS
+DataWSLS_simple_Stay1_Shift1_P1 <- WSLSsimulationSimple(P,N,StayBiasG,ShiftBiasG,BiasVariation)
+DataWSLS_simple_Stay0_Shift0_P1 <- WSLSsimulationSimple(P,N,StayBiasG=0,ShiftBiasG=0,BiasVariation)
+DataWSLS_simple_Stay2_Shift0_P1 <- WSLSsimulationSimple(P,N,StayBiasG=2,ShiftBiasG=0,BiasVariation)
+DataWSLS_simple_Stay0_Shift2_P1 <- WSLSsimulationSimple(P,N,StayBiasG=0,ShiftBiasG=2,BiasVariation)
+
+# For WSLS vs. WSLS
+DataWSLS_WSLS_Stay1_Shift1_P1_Ostay2_Oshift2 <- WSLSsimulationWSLS(P,N,StayBiasG,ShiftBiasG, BiasVariation,OtherStayBias,OtherShiftBias) #different biases
+DataWSLS_WSLS_Stay1_Shift1_P1_Ostay1_Oshift1 <- WSLSsimulationWSLS(P,N,StayBiasG,ShiftBiasG, BiasVariation,OtherStayBias=1,OtherShiftBias=1) #same biases
+
+
+# For RL
+d1_1 <- RLsimulationSimple(P,N,LearningRateG,BiasVariation,Theta=0.7)
+d1_2 <- RLsimulationSimple(P,N,LearningRateG=1,BiasVariation,Theta=0.7)
+d1_3 <- RLsimulationSimple(P,N,LearningRateG=2,BiasVariation,Theta=0.7)
+
+d2_1 <- RLsimulationSimple(P,N,LearningRateG,BiasVariation,Theta=0.05)
+d2_2 <- RLsimulationSimple(P,N,LearningRateG=1,BiasVariation,Theta=0.05)
+d2_3 <- RLsimulationSimple(P,N,LearningRateG=2,BiasVariation,Theta=0.05)
+# For RL vs. RL
+d3_1 <- RLsimulationRL(P,N,LearningRateG,BiasVariation,Theta=0.7,OtherLearningRate)
+d3_2 <- RLsimulationRL(P,N,LearningRateG=1,BiasVariation,Theta=0.7,OtherLearningRate=1)
+d3_3 <- RLsimulationRL(P,N,LearningRateG=2,BiasVariation,Theta=0.7,OtherLearningRate=0)
+
+# For RL vs. WSLS
+d4_1 <- WSLSsimulationRL(P,N,StayBiasG=1,ShiftBiasG=1,BiasVariation=1, LearningRateG=0)
+d4_2 <- WSLSsimulationRL(P,N,StayBiasG=1,ShiftBiasG=1,BiasVariation=1, LearningRateG=1)
+```
+
+
+## Running the Stan models on the generated datasets and plotting
+Biased Nash example:
+Change the dataframe to run on different dataset
+```{r}
+# Create list with information to be passed to the Stan model from the data
+data_list <- list(Subject = DataNash_G50_P1$subjectID, y=DataNash_G50_P1$outcome, N=N*P, P=P)
+
+# Fit the model on the data
+nash_fit <- stan(file = "nash_sim.stan", data = data_list, cores=1, chains=1, iter=1000)
+nash_fit
+
+```
+
+Now plot data to assess model estimates against the known values
+```{r}
+# Retrieve the known parameters from the dataset 
+known_parameters <- DataNash_G50_P1 %>% group_by(subjectID) %>% summarise(theta=mean(thetaP))
+
+#Rename the columns and ID variable. Makes combining the data easier later
+for (i in seq(P)) {
+  known_parameters$subjectID[i] = paste('thetaP[',i,']', sep="")
+}
+names(known_parameters)[names(known_parameters)=="subjectID"] <- "variable"
+
+#Create a combined dataframe for plotting
+#Extract the estimated parameters from the fit
+plot_data = extract(nash_fit, permuted = F, pars = c("thetaP")) %>% 
+  # Stack chains (wide to long melt), drop the chain label
+  plyr::adply(2) %>% 
+  dplyr::select(-chains) %>% 
+  melt() %>% 
+  # Perform a left join with the known parameters
+  left_join(known_parameters, by = "variable")
+
+#the estimates are on the logit scale. inverse this to get more intepretable values
+plot_data$value = inv.logit(plot_data$value)
+
+#Generate plot
+plot_data %>%
+  ggplot(aes(x = value)) + 
+  geom_density(fill = "cornflowerblue", alpha = 0.5) + # create density plot
+  facet_wrap(~ variable, scales = "free") + # display the participants together
+  geom_vline(aes(xintercept = (theta)), colour = "red") + # display known value
+  ggtitle("Nash thetaG 0.5\nActual parameters and estimates\n") # give title 
+
+#Get the mean and SD for estimated value distributions 
+nash50 <- as.data.frame(Rmisc::summarySE(plot_data, "value", c("variable","theta")))
+#Calculate absolute difference
+nash50$difference <- abs(nash50$theta-nash50$value)
+#Save as table in txt format
+write.table(nash50, "nash50.txt", sep="\t")
+
+# Print mean difference
+summarySE(nash50,"difference")
+
+```
+
+
+Biased Nash example:
+Change the dataframe to run on different dataset
+```{r}
+# Create list with information to be passed to the Stan model from the data
+data_listWSLS <- list(subject = DataWSLS_simple_Stay1_Shift1_P1$Participant, right=DataWSLS_simple_Stay1_Shift1_P1$Right, success = DataWSLS_simple_Stay1_Shift1_P1$Success, N=N*P, P=P)
+
+# Fit the model on the data
+WSLS_fit <- stan(file = "WSLS_sim.stan", data = data_listWSLS, cores=3, chains=1, iter=1000)
+WSLS_fit
+```
+
+Now plot data to assess model estimates against the known values
+```{r}
+# Retrieve the known parameters from the dataset 
+known_parametersWSLS <- DataWSLS_simple_Stay1_Shift1_P1 %>% group_by(Participant) %>% dplyr::summarise(stayBias=mean(StayBias), shiftBias=mean(ShiftBias)) 
+
+#Rename the columns and ID variable. Makes combining the data easier later
+for (i in seq(P)) {
+  known_parametersWSLS$Participant[i] = paste('stayBiasP[',i,']', sep="")
+}
+names(known_parametersWSLS)[names(known_parametersWSLS)=="Participant"] <- "variable"
+
+#Create a combined dataframe for plotting the stay bias
+#Extract the estimated stay parameters from the fit
+plot_dataWSLSStay = extract(WSLS_fit, permuted = F, pars = c("stayBiasP")) %>% 
+  # Stack chains, drop the chain label
+  plyr::adply(2) %>% 
+  dplyr::select(-chains) %>% 
+  melt() %>%
+  # Perform a left join with the known parameters
+  left_join(known_parametersWSLS, by="variable")
+# rename variable to make sense
+names(plot_dataWSLSStay)[names(plot_dataWSLSStay)=="value"] <- "stayBiasSim"
+
+#Create a combined dataframe for plotting the shift bias
+#Extract the estimated shift parameters from the fit
+plot_dataWSLSShift = extract(WSLS_fit, permuted = F, pars = c("shiftBiasP")) %>%
+  # Stack chains (wide to long melt), drop the chain label
+  plyr::adply(2) %>% 
+  dplyr::select(-chains) %>% 
+  melt()
+# rename variable to make sense
+names(plot_dataWSLSShift)[names(plot_dataWSLSShift)=="value"] <- "shiftBiasSim"
+
+#Combine stay and shift bias in a single data frame
+plot_dataWSLSShift = subset(plot_dataWSLSShift, select=c('shiftBiasSim'))
+plot_dataWSLS = cbind(plot_dataWSLSStay, plot_dataWSLSShift)
+
+#the estimates are on the logit scale. inverse this to get more intepretable values
+plot_dataWSLS$stayBiasSim = inv.logit(plot_dataWSLS$stayBiasSim)
+plot_dataWSLS$shiftBiasSim = inv.logit(plot_dataWSLS$shiftBiasSim)
+
+#Generate plots
+stayPlot <- plot_dataWSLS %>%
+  ggplot(aes(x = stayBiasSim)) + 
+  geom_density(fill = "cornflowerblue", alpha = 0.5) + # create density plot
+  facet_wrap(~ variable, scales = "free") + # display the participants together
+  geom_vline(aes(xintercept = stayBias), colour = "red") + # display known value
+  ggtitle("WSLS stay bias 1, shift bias 1\nActual stay bias and estimates\n") # give title
+
+shiftPlot <- plot_dataWSLS %>%
+  ggplot(aes(x = shiftBiasSim)) + 
+  geom_density(fill = "cornflowerblue", alpha = 0.5) + # create density plot
+  facet_wrap(~ variable, scales = "free") + # display the participants together
+  geom_vline(aes(xintercept = shiftBias), colour = "red") + # display known value
+  ggtitle("WSLS stay bias 1, shift bias 1\nActual shift bias and estimates\n") # give title
+
+
+#Get the mean and SD for estimated value distributions 
+WSLSstay <- as.data.frame(Rmisc::summarySE(plot_dataWSLS, "stayBiasSim", c("variable","stayBias")))
+WSLSshift <- as.data.frame(Rmisc::summarySE(plot_dataWSLS, "shiftBiasSim", c("variable","shiftBias")))
+
+#Calculate absolute difference
+WSLSstay$difference <- abs(WSLSstay$stayBias-WSLSstay$stayBiasSim)
+WSLSshift$difference <- abs(WSLSshift$shiftBias-WSLSshift$shiftBiasSim)
+
+#Save as table in txt format
+write.table(WSLSstay, "WSLSstay.txt", sep="\t")
+write.table(WSLSshift, "WSLSshift.txt", sep="\t")
+
+# Print mean difference
+summarySE(WSLSstay,"difference")
+summarySE(WSLSshift,"difference")
+
+```
+
+
+Reinforcement learning example:
+Change the dataframe to run on different dataset
+```{r}
+#Load hBayesDM package
+library(hBayesDM)
+
+# To use the hBayesDM function bandit2arm_delta, the data has to look a certian way
+# Now that we know this, it would be easier to change the data simulation function, but for now we just rename the columns afterwards
+
+#rename ID column
+names(d1_1)[names(d1_1)=="Participant"] <- "subjID"
+#rename outcome column. Change values from 0 and 1 to 1 and 2
+names(d1_1)[names(d1_1)=="Right"] <- "choice"
+d1_1$choice = d1_1$choice+1
+#rename success. Change values from 0 and 1 to -1 and 1 
+names(d1_1)[names(d1_1)=="Success"] <- "outcome"
+d1_1$outcome = d1_1$outcome*2-1
+
+#Save this data to a txt file so we can choose it for the bandit2arm_delta function
+write.table(d1_1, "simpleRL1.txt", sep="\t")
+
+#Fit model on data
+RL_fitSimple1 <- bandit2arm_delta(data =  "choose",niter = 1000, nwarmup = 500, nchain = 1)
+RL_fitSimple1
+```
+
+Now plot data to assess model estimates against the known values
+```{r}
+# Retrieve the known parameters from the dataset 
+known_parametersRL1 <- d1_1 %>% group_by(subjID) %>% summarise(valueRight=mean(ValueRight), valueLeft=mean(ValueLeft), learningRate=mean(LearningRate))
+
+#Rename the columns and ID variable. Makes combining the data easier later
+for (i in seq(P)) {
+  known_parametersRL1$subjID[i] = paste('LearningRateP[',i,']', sep="")
+}
+names(known_parametersRL1)[names(known_parametersRL1)=="subjID"] <- "key"
+
+# Extract estimated learning rate from the fit and save to dataframe
+temp = as.data.frame(RL_fitSimple1$parVals$A)
+#rename columns to make sense
+colnames(temp) <- c("LearningRateP[1]","LearningRateP[2]","LearningRateP[3]","LearningRateP[4]","LearningRateP[5]","LearningRateP[6]","LearningRateP[7]","LearningRateP[8]","LearningRateP[9]","LearningRateP[10]")
+
+#convert data to long format
+temp2 = gather(temp)
+
+#create combined data for plotting
+plot_dataRLSimple1 = temp2 %>%
+  left_join(known_parametersRL1, by="key")
+
+# Generate the plot
+plot_dataRLSimple1 %>%
+  ggplot(aes(x = value)) + 
+  geom_density(fill = "cornflowerblue", alpha = 0.5) +# create density plot
+  facet_wrap(~ key, scales = "free") + # display the participants together
+  geom_vline(aes(xintercept = learningRate), colour = "red") + # display known value
+  ggtitle("RL learning rate of 0\nActual learning rate and estimates\n")# give title
+
+#Get the mean and SD for estimated value distributions 
+RL1 <- as.data.frame(Rmisc::summarySE(plot_dataRLSimple1, "value", c("key","learningRate")))
+
+#Calculate absolute difference
+RL1$difference <- abs(RL1$value-RL1$learningRate)
+
+#Save as table in txt format
+write.table(RL1, "RL1", sep="\t")
+
+# Print mean difference
+Rmisc::summarySE(RL1,"difference")
+
+```
+
